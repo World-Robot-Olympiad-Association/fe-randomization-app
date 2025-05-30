@@ -14,7 +14,7 @@ The type of the challenge as well as the challenge driving direction are defined
 - `/final/ccw` - the obstacle challenge round with counter-clockwise driving direction
 """
 
-from flask import Flask, make_response, render_template
+from flask import Flask, make_response, render_template, request
 import cv2
 import numpy as np
 from random import randint, choice, sample
@@ -296,6 +296,10 @@ class Color(Enum):
     GREEN = (44, 214, 68)
     UNDEFINED = (0,0,0)
 
+class ParkingComplexity(Enum):
+    standard = "standard"
+    challenged = "challenged"
+
 class Obstacle:
     """
     Represents an obstacle on the game mat.
@@ -342,33 +346,6 @@ class StartZone(Enum):
     Z4 = (Intersection.T4, Intersection.X1)
     Z5 = (Intersection.TopMiddle, Intersection.T3)
     Z6 = (Intersection.TopLeft, Intersection.X2)
-
-# Intersections that will be in front of the vehicle for the given direction
-# and the given start zone.
-# Direction clockwise:
-#   Z3: T1, T3
-#   Z4: X1, X2
-# Direction counter-clockwise:
-#   Z3: X1, X2
-#   Z4: T2, T4
-forbidden_intersections_in_start_zone = {
-    Direction.CW: {
-        StartZone.Z3: [Intersection.T1, Intersection.T3],
-        StartZone.Z4: [Intersection.X1, Intersection.X2]
-    },
-    Direction.CCW: {
-        StartZone.Z3: [Intersection.X1, Intersection.X2],
-        StartZone.Z4: [Intersection.T2, Intersection.T4]
-    }
-}
-
-# According to the rules, these intersections in the straightforward section containing
-# the parking lot cannot be used for the obstacle placement.
-forbidden_intersections_in_parking_section = [
-    Intersection.T3,
-    Intersection.T4,
-    Intersection.X2
-]
 
 class VehiclePosition:
     """
@@ -549,6 +526,22 @@ mandatory_obstacles_sets = {
 # make to reduce risk when incomplete solutions solve the challenge.
 required_obstacles_sets = [ 21, 22, 27, 28 ]
 
+# Obstacles in the starting section could be placed only on postions further
+# from parking lot.
+starting_section_obstacle_sets = {
+    ParkingComplexity.standard : {
+        Direction.CW: { 4, 5, 20, 21, 22, 23, 24, 25 },
+        Direction.CCW: { 0, 1, 2, 3 }
+    },
+    ParkingComplexity.challenged : {
+        Direction.CW: { 5, 21, 23, 25 },
+        Direction.CCW: { 2 }
+    }
+}
+
+# Minimal number of obstacles on the field in the obstacle challenge.
+desired_complexity = 6
+
 # Relative coordinates of the vehicle starting zones in the straightforward sections 
 # for the Open challenge rounds.
 vehicle_positions_in_open = [
@@ -560,12 +553,9 @@ vehicle_positions_in_open = [
     VehiclePosition(StartZone.Z1)
 ]
 
-# Relative coordinates of the vehicle starting zones in the straightforward sections 
-# for the Obstacle challenge rounds.
-vehicle_positions_in_obstacle = [
-    VehiclePosition(StartZone.Z4),
-    VehiclePosition(StartZone.Z3)
-]
+# Basic vehicle starting zone in the straightforward sections for the Obstacle
+# challenge rounds.
+basic_vehicle_starting_zone = StartZone.Z4
 
 # game field image template
 template = np.zeros((height+border*2,width+border*2,3), np.uint8)
@@ -763,7 +753,7 @@ def randomize_and_draw_layout_for_open(direction: Direction) -> np.ndarray:
 
     return image
         
-def randomize_and_draw_layout_for_obstacle(direction: Direction) -> np.ndarray:
+def randomize_and_draw_layout_for_obstacle(direction: Direction, is_international: bool) -> np.ndarray:
     """
     Generate the game field for the Obstacle challenge rounds.
 
@@ -771,16 +761,14 @@ def randomize_and_draw_layout_for_obstacle(direction: Direction) -> np.ndarray:
     every pixel is represented by three numbers corresponding to the BGR color.
     """
 
-    # The set of intersections that will be in front of the vehicle in the start zone
-    # for the given driving direction.
-    forbidden_intersections = forbidden_intersections_in_start_zone[direction]
+    parking_complexity = ParkingComplexity.challenged if is_international else ParkingComplexity.standard
 
     # Look for the obstacles sets that satisfy the conditions:
     # - the difference between the number of green and red obstacles is not greater than one
-    # - the total number of obstacles is at least 5
-    # - there is at least one valid start zone for the given combination of obstacles
+    # - the total number of obstacles correspons to desired complexity
     satisfied = False
     while not satisfied:
+
         # Choose the index of the mandatory obstacles set.
         mandatory_set_color = choice([Color.GREEN, Color.RED])
         mandatory_obstacles_set = mandatory_obstacles_sets[mandatory_set_color]
@@ -788,22 +776,34 @@ def randomize_and_draw_layout_for_obstacle(direction: Direction) -> np.ndarray:
         # Choose the index of the required obstacles set.
         required_obstacles_set = choice(required_obstacles_sets)
 
-        # Choose the index of the obstacles set for one of two remaining sections.
+        # Choose all possible obstacle sets in starting section for the given direction
+        possible_sets_in_starting_sections = starting_section_obstacle_sets[parking_complexity][direction]
+        # Check if an applicable obstacle sets have been already chosen
+        already_chosen_sets_for_starting_section = possible_sets_in_starting_sections & {mandatory_obstacles_set, required_obstacles_set}
+        if already_chosen_sets_for_starting_section:
+            # Pick one of chosen sets for the starting section
+            set_for_starting_section = choice(list(already_chosen_sets_for_starting_section))
+        else:
+            # No sets have been chosen. Pick on of the possible sets for the starting section
+            set_for_starting_section = choice(list(possible_sets_in_starting_sections))
+
+        # Choose the index of the obstacles set for remaining section.
         os1 = mandatory_obstacles_set
-        while os1 == required_obstacles_set or os1 == mandatory_obstacles_set:
+        while os1 in {required_obstacles_set, mandatory_obstacles_set, set_for_starting_section}:
             os1 = randint(0, len(obstacles_sets)-1)
 
-        # Choose the index of the obstacles set for the last remaining section.
-        os2 = mandatory_obstacles_set
-        while os2 == required_obstacles_set or os2 == mandatory_obstacles_set or os2 == os1:
-            os2 = randint(0, len(obstacles_sets)-1)
+        # Check if enough sections have been chosen
+        if len({os1, required_obstacles_set, mandatory_obstacles_set, set_for_starting_section}) == 4:
+            chosen_obstacles_sets_indices = [mandatory_obstacles_set, required_obstacles_set, set_for_starting_section, os1]
+        else:
+            # Seams set_for_starting_section matches with required_obstacles_set or mandatory_obstacles_set
+            # Choose the index of the obstacles set for the last remaining section.
+            os2 = mandatory_obstacles_set
+            while os2 == required_obstacles_set or os2 == mandatory_obstacles_set or os2 == os1:
+                os2 = randint(0, len(obstacles_sets)-1)
+            chosen_obstacles_sets_indices = [mandatory_obstacles_set, required_obstacles_set, os1, os2]
 
-        chosen_obstacles_sets_indices = [mandatory_obstacles_set, required_obstacles_set, os1, os2]
-
-        # Calculate the number of obstacles, the number of green and red obstacles and
-        # the forbidden start zones for choosen obstacles sets.
-        forbidden_start_zones = {}
-        obstacles_set_conflicting_with_parking_section = set()
+        # Calculate the number of obstacles, the number of green and red obstacles.
         obstacles_amount = 0
         green_amount = 0
         red_amount = 0
@@ -812,7 +812,6 @@ def randomize_and_draw_layout_for_obstacle(direction: Direction) -> np.ndarray:
 
             obstacles_amount = obstacles_amount + len(one_obstacles_set)
 
-            forbidden_start_zones[obstacles_set_index] = set()
             for one_obstacle in one_obstacles_set:
                 if one_obstacle.is_green():
                     green_amount = green_amount + 1
@@ -820,38 +819,12 @@ def randomize_and_draw_layout_for_obstacle(direction: Direction) -> np.ndarray:
                     red_amount = red_amount + 1
                 else:
                     raise ValueError("Unknown obstacle color")
-                
-                # Check if the current obstacle would be in front of the vehicle
-                # for each possible starting zone in this section
-                for zone in forbidden_intersections:
-                    if one_obstacle.position in forbidden_intersections[zone]:
-                        forbidden_start_zones[obstacles_set_index].add(zone)
-
-                # Check if the current obstacle's position is suitable for the
-                # section where the parking lot is located.
-                for intersection in forbidden_intersections_in_parking_section:
-                    if one_obstacle.position == intersection:
-                        obstacles_set_conflicting_with_parking_section.add(obstacles_set_index)
-
-        # Remove obstacle sets where both possible start zones are forbidden, keeping
-        # only sets that have at least one valid start zone.
-        for obstacles_set_index in forbidden_start_zones:
-            if len(forbidden_start_zones[obstacles_set_index]) == 2:
-                del forbidden_start_zones[obstacles_set_index]
-
-        # Get all obstacle sets that are suitable for the parking section.
-        obstacles_set_suitable_for_parking_section = set(chosen_obstacles_sets_indices) - \
-            obstacles_set_conflicting_with_parking_section
 
         # Stops to look for the obstacles sets if the conditions are satisfied:
         # - the difference between the number of green and red obstacles is not greater than one
-        # - the total number of obstacles is at least 5
-        # - there is at least one valid start zone for the given combination of obstacles
-        # - there is at least one obstacle set that is suitable for the parking section
+        # - the total number of obstacles corresponds to desired complexity
         satisfied = (abs(green_amount - red_amount) <= 1) and \
-            (obstacles_amount > 4) and \
-            (len(forbidden_start_zones) > 0) and \
-            (len(obstacles_set_suitable_for_parking_section) > 0)
+            (obstacles_amount >= desired_complexity)
 
     # Cannot use list(Section) because elements of Section are functions.
     sections = [Section.NORTH, Section.WEST, Section.SOUTH, Section.EAST]
@@ -862,24 +835,14 @@ def randomize_and_draw_layout_for_obstacle(direction: Direction) -> np.ndarray:
     for obstacles_set_index in chosen_obstacles_sets_indices:
         sections_for_obstacles_sets[obstacles_set_index] = shuffled_sections.pop()
 
-    # Choose one of the obstacle sets that has at least one valid start zone.
-    obstacles_set_in_start_section = choice(list(forbidden_start_zones.keys()))
     # Choose the section where the chosen obstacle set is located.
-    start_section = sections_for_obstacles_sets[obstacles_set_in_start_section]
-
-    # Choose one of the obstacle sets that is suitable for the parking section.
-    obstacles_set_in_parking_section = choice(list(obstacles_set_suitable_for_parking_section))
-    # Choose the section where the chosen obstacle set is located.
-    parking_section = sections_for_obstacles_sets[obstacles_set_in_parking_section]
-
-    # Choose one of the valid start zones for the chosen obstacle set.
-    start_zone = choice(list(set([StartZone.Z3, StartZone.Z4]) - forbidden_start_zones[obstacles_set_in_start_section]))
+    start_section = sections_for_obstacles_sets[set_for_starting_section]
 
     scheme = {
         'start_section': start_section,
-        'start_zone': start_zone,
+        'start_zone': basic_vehicle_starting_zone,
         'obstacles': sections_for_obstacles_sets,
-        'parking_section': parking_section
+        'parking_section': start_section
     }
     image = draw_scheme_for_final(scheme)
 
@@ -926,13 +889,15 @@ def generate_qualification_ccw():
 
 @app.route('/final/cw')
 def generate_final_cw():
-    layout = randomize_and_draw_layout_for_obstacle(Direction.CW)
+    is_international = request.args.get('international') == "true"
+    layout = randomize_and_draw_layout_for_obstacle(Direction.CW, is_international)
     response = generate_image(layout)
     return response
 
 @app.route('/final/ccw')
 def generate_final_ccw():
-    layout = randomize_and_draw_layout_for_obstacle(Direction.CCW)
+    is_international = request.args.get('international') == "true"
+    layout = randomize_and_draw_layout_for_obstacle(Direction.CCW, is_international)
     response = generate_image(layout)
     return response
 
